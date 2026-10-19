@@ -1,41 +1,26 @@
-import subprocess
-import json
+name: Video Processor
+on:
+  workflow_dispatch: # Allows manual trigger
 
-def get_video_duration(file_path):
-    # Use ffprobe to get the exact duration of the video in seconds
-    cmd = [
-        'ffprobe', '-v', 'error', '-show_entries',
-        'format=duration', '-of',
-        'default=noprint_wrappers=1:nokey=1', file_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return float(result.stdout)
-
-def process_video(input_file):
-    duration_seconds = get_video_duration(input_file)
-    two_hours_in_seconds = 7200
-    
-    if duration_seconds > two_hours_in_seconds:
-        print(f"File is {duration_seconds/3600:.2f} hours long. Splitting into 2-hour segments...")
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
         
-        # Run the FFmpeg segment command
-        split_cmd = [
-            'ffmpeg', '-i', input_file, 
-            '-c', 'copy', 
-            '-map', '0', 
-            '-segment_time', '02:00:00', 
-            '-f', 'segment', 
-            '-reset_timestamps', '1',
-            'output_part_%03d.mp4'
-        ]
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install Python packages
+        run: pip install google-api-python-client google-auth httplib2
         
-        subprocess.run(split_cmd, check=True)
-        print("Splitting complete. You can now upload the 'output_part_xxx.mp4' files.")
-        
-        # Note: You will need to write a small loop here to find all files starting 
-        # with 'output_part_' and upload them back to Google Drive using drive_service.
-        
-    else:
-        print("File is under 2 hours. Proceeding with standard compression if needed.")
-        # Add your 200MB compression logic here
-        
+      - name: Run Processing Script
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: python process_video.py
