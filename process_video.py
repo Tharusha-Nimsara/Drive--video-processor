@@ -1,100 +1,134 @@
 import os
-import json
 import subprocess
+import math
 import io
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# --- 1. Authenticate using ONLY the bucket folder ---
-creds_json = os.environ.get('GCP_CREDENTIALS')
-bucket_folder_id = os.environ.get('DRIVE_FOLDER_ID')
+# --- CONFIGURATION ---
+FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID')
+CHUNK_DURATION_SEC = 7200  # 2 hours
 
-creds_dict = json.loads(creds_json)
-# This scope allows deletion. No Google Cloud Console changes are needed.
-creds = service_account.Credentials.from_service_account_info(
-    creds_dict, scopes=['https://www.googleapis.com/auth/drive']
-)
-drive_service = build('drive', 'v3', credentials=creds)
+def get_gdrive_service():
+    """Authenticates using the OAuth Refresh Token."""
+    print("Authenticating with Google Drive via OAuth...")
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ['GCP_REFRESH_TOKEN'],
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=os.environ['GCP_CLIENT_ID'],
+        client_secret=os.environ['GCP_CLIENT_SECRET']
+    )
+    return build('drive', 'v3', credentials=creds)
 
-# --- 2. Helper Functions ---
-def get_duration(file_path):
-    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    try: return float(result.stdout.strip())
-    except ValueError: return 0.0
-
-def download_file(file_id, file_name):
-    print(f"Downloading {file_name}...")
-    request = drive_service.files().get_media(fileId=file_id)
-    fh = io.FileIO(file_name, 'wb')
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done: status, done = downloader.next_chunk()
-
-def upload_file(file_path, parent_folder_id):
-    print(f"Uploading {file_path} back to bucket...")
-    file_metadata = {'name': os.path.basename(file_path), 'parents': [parent_folder_id]}
-    media = MediaFileUpload(file_path, resumable=True)
-    drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-
-# --- 3. Main Logic ---
-results = drive_service.files().list(
-    q=f"'{bucket_folder_id}' in parents and trashed=false",
-    fields="files(id, name)"
-).execute()
-files = results.get('files', [])
-
-if not files:
-    print("No new files to process today.")
-    exit()
-
-for f in files:
-    file_id = f['id']
-    original_name = f['name'].replace(" ", "_")
-    
-    # Skip files that were already processed so they don't get deleted
-    if original_name.startswith("compressed_") or original_name.startswith("split_"):
-        continue
-    
-    download_file(file_id, original_name)
-    duration = get_duration(original_name)
-    files_to_compress = []
-    
-    # Rule 1: Split if > 2 hours
-    if duration > 7200:
-        print(f"File > 2 hours. Splitting...")
-        subprocess.run([
-            'ffmpeg', '-i', original_name, '-c', 'copy', '-map', '0', 
-            '-segment_time', '02:00:00', '-f', 'segment', 
-            '-reset_timestamps', '1', f"split_%03d_{original_name}"
-        ], check=True)
-        for item in os.listdir('.'):
-            if item.startswith("split_") and item.endswith(original_name):
-                files_to_compress.append(item)
-    else:
-        files_to_compress.append(original_name)
-        
-    # Rule 2: Compress EVERYTHING to save space
-    for target_file in files_to_compress:
-        print(f"Compressing {target_file} to save space...")
-        compressed_name = f"compressed_{target_file}"
-        
-        # Check if the file is an audio file like MP3 to use the right codec
-        if target_file.lower().endswith(('.mp3', '.m4a', '.wav')):
-            subprocess.run(['ffmpeg', '-i', target_file, '-b:a', '64k', compressed_name], check=True)
-        else:
-            subprocess.run(['ffmpeg', '-i', target_file, '-vcodec', 'libx265', '-preset', 'veryfast', '-crf', '28', compressed_name], check=True)
-        
-        # Upload right back to the original bucket folder
-        upload_file(compressed_name, bucket_folder_id)
-        
-    # Rule 3: PERMANENTLY DELETE original file
-    print(f"Permanently deleting original {original_name} to free up space...")
+def get_media_duration(filepath):
+    """Uses ffprobe to get the duration of the media file in seconds."""
+    cmd = [
+        'ffprobe', '-v', 'error', '-show_entries',
+        'format=duration', '-of',
+        'default=noprint_wrappers=1:nokey=1', filepath
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        drive_service.files().delete(fileId=file_id).execute()
-        print(f"Successfully deleted {original_name}.")
-    except Exception as e:
-        print(f"Failed to delete {original_name}. Error: {e}")
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
 
-print("Processing complete!")
+def process_and_compress(input_file, output_file, start_time=None, duration=None):
+    """Compresses (and optionally splits) the file aggressively using FFmpeg."""
+    cmd = ['ffmpeg', '-y']
+    
+    if start_time is not None:
+        cmd.extend(['-ss', str(start_time)])
+    if duration is not None:
+        cmd.extend(['-t', str(duration)])
+        
+    cmd.extend(['-i', input_file])
+    
+    # Aggressive compression settings: libx264 video, CRF 28, fast preset, 64k audio
+    cmd.extend([
+        '-c:v', 'libx264',
+        '-crf', '28',
+        '-preset', 'fast',
+        '-c:a', 'aac',
+        '-b:a', '64k',
+        output_file
+    ])
+    
+    print(f"Running FFmpeg: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+def main():
+    service = get_gdrive_service()
+    
+    # List files in the target folder
+    results = service.files().list(
+        q=f"'{FOLDER_ID}' in parents and trashed=false",
+        fields="files(id, name, mimeType)"
+    ).execute()
+    files = results.get('files', [])
+
+    if not files:
+        print("No files found in the specified Drive folder.")
+        return
+
+    for f in files:
+        file_id = f['id']
+        file_name = f['name']
+        
+        # Skip previously processed files to prevent infinite loops
+        if file_name.startswith("processed_"):
+            continue
+
+        print(f"\n--- Processing: {file_name} ---")
+        local_filename = f"temp_{file_name}"
+
+        # 1. Download the file
+        print("Downloading...")
+        request = service.files().get_media(fileId=file_id)
+        with io.FileIO(local_filename, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+        
+        # 2. Check duration
+        duration = get_media_duration(local_filename)
+        print(f"Duration: {duration} seconds")
+
+        output_files = []
+
+        # 3. Split if over 2 hours, otherwise just compress
+        if duration > CHUNK_DURATION_SEC:
+            chunks = math.ceil(duration / CHUNK_DURATION_SEC)
+            print(f"File exceeds 2 hours. Splitting into {chunks} parts...")
+            for i in range(chunks):
+                start = i * CHUNK_DURATION_SEC
+                part_name = f"processed_part{i+1}_{file_name}"
+                process_and_compress(local_filename, part_name, start_time=start, duration=CHUNK_DURATION_SEC)
+                output_files.append(part_name)
+        else:
+            print("File is under 2 hours. Compressing whole file...")
+            out_name = f"processed_{file_name}"
+            process_and_compress(local_filename, out_name)
+            output_files.append(out_name)
+
+        # 4. Upload the processed files back to the same folder
+        for out_file in output_files:
+            print(f"Uploading {out_file}...")
+            file_metadata = {'name': out_file, 'parents': [FOLDER_ID]}
+            media = MediaFileUpload(out_file, resumable=True)
+            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            os.remove(out_file) # Clean up local processed file
+
+        # 5. Delete the original massive file from Drive
+        print(f"Deleting original file '{file_name}' from Drive...")
+        service.files().delete(fileId=file_id).execute()
+        
+        # Clean up local original file
+        os.remove(local_filename)
+        print("Done with this file.")
+
+if __name__ == '__main__':
+    main()
