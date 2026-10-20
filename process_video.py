@@ -36,7 +36,7 @@ def get_media_duration(filepath):
         return 0.0
 
 def process_and_compress(input_file, output_file, start_time=None, duration=None):
-    """Compresses (and optionally splits) the file aggressively using FFmpeg."""
+    """Compresses the file based on whether it is audio or video."""
     cmd = ['ffmpeg', '-y']
     
     if start_time is not None:
@@ -46,16 +46,26 @@ def process_and_compress(input_file, output_file, start_time=None, duration=None
         
     cmd.extend(['-i', input_file])
     
-    # Aggressive compression settings: libx264 video, CRF 28, fast preset, 64k audio
-    cmd.extend([
-        '-c:v', 'libx264',
-        '-crf', '28',
-        '-preset', 'fast',
-        '-c:a', 'aac',
-        '-b:a', '64k',
-        output_file
-    ])
+    # Detect if file is audio-only based on extension
+    is_audio = input_file.lower().endswith(('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'))
     
+    if is_audio:
+        # Audio compression: MP3 format, 64k bitrate
+        cmd.extend([
+            '-c:a', 'libmp3lame',
+            '-b:a', '64k'
+        ])
+    else:
+        # Video compression: libx264 video, CRF 28, fast preset, 64k AAC audio
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-crf', '28',
+            '-preset', 'fast',
+            '-c:a', 'aac',
+            '-b:a', '64k'
+        ])
+    
+    cmd.append(output_file)
     print(f"Running FFmpeg: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
@@ -120,15 +130,15 @@ def main():
             file_metadata = {'name': out_file, 'parents': [FOLDER_ID]}
             media = MediaFileUpload(out_file, resumable=True)
             service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            os.remove(out_file) # Clean up local processed file
+            os.remove(out_file)
 
         # 5. Delete the original massive file from Drive
         print(f"Deleting original file '{file_name}' from Drive...")
         service.files().delete(fileId=file_id).execute()
         
-        # Clean up local original file
         os.remove(local_filename)
         print("Done with this file.")
 
 if __name__ == '__main__':
     main()
+                  
